@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>webCRT</title>
+<style>
+  /* Two colors: --k (black) and --g (phosphor green), plus --gh (dark green) used only as the
+     hover background of controls. One font size (14px) everywhere, no bold: emphasis is [ text ]. */
+  :root {
+    --k: #000;
+    --g: #3dff6e;
+    --gh: #0e4a1f;
+    /* Latin letters and digits come from the first font; Korean falls through to the next font
+       that has Hangul. Windows: Segoe UI + 맑은 고딕. macOS: San Francisco (-apple-system) +
+       Apple SD Gothic Neo. Others: Noto Sans KR if installed. */
+    --font: "Segoe UI", -apple-system, BlinkMacSystemFont, "Malgun Gothic", "맑은 고딕",
+            "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--k); color: var(--g); font-family: var(--font); font-size: 14px; overflow: hidden; }
+  h1, h2, h3, b, strong { font-size: inherit; font-weight: normal; }
+  /* Korean wraps at spaces, not mid-word; very long tokens (URLs) may still break */
+  body { word-break: keep-all; overflow-wrap: anywhere; }
+  body { display: flex; flex-direction: column; }
+  ::selection { background: var(--g); color: var(--k); }
+
+  /* One row, never wraps. As the window narrows (driven by layoutHeader() in app.js):
+     1. URL field shrinks to ~8 characters   2. logo folds to two lines (.fold)
+     3. shader select shrinks to ~3 characters   4. shader select shows only its arrow (.sel-v)
+     Focusing a minimum-size URL field hides everything right of it (.url-focus). */
+  header {
+    display: flex; align-items: center; gap: 8px; flex-wrap: nowrap; overflow: hidden;
+    padding: 12px 20px 10px;
+  }
+  header.hidden { display: none; }
+  header > * { flex: none; }
+  .logo { margin-right: 6px; white-space: nowrap; }
+  #bar.fold .logo { line-height: 1.05; margin-right: 0; }
+  #bar.fold .logo span { display: block; }
+
+  button, select, input[type=text] {
+    font: inherit; color: var(--g); background: var(--k); border: 1px solid var(--g);
+    padding: 0 10px; height: 30px; border-radius: 0; outline: none;
+  }
+  /* Segoe UI keeps extra room above its letters, so text sat ~1px low in the 30px controls.
+     Trimming the line box to cap height / baseline centers the actual letters. */
+  button { text-box: trim-both cap alphabetic; }
+  @supports not (text-box: trim-both cap alphabetic) {
+    button { padding-bottom: 2px; }          /* older browsers: lift the text ~1px instead */
+  }
+  button { cursor: pointer; }
+  button.on, button.primary { background: var(--g); color: var(--k); }
+  select {
+    cursor: pointer; -webkit-appearance: none; appearance: none; padding-right: 28px;
+    background: var(--k) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 9 5'%3E%3Cpath d='M.5 .5L4.5 4.5L8.5 .5' fill='none' stroke='%233dff6e' stroke-width='1'/%3E%3C/svg%3E") no-repeat right 10px center / 9px 5px; /* 1px v, same as .chev */
+    white-space: nowrap; overflow: hidden;
+  }
+  /* Hover = dark green background (no border change). Filled (green) buttons darken slightly. */
+  button:hover, select:hover, input[type=text]:hover { background-color: var(--gh); }
+  button.on:hover, button.primary:hover { background-color: var(--g); filter: brightness(.82); }
+  option { background: var(--k); color: var(--g); }
+  input[type=text]::placeholder { color: var(--g); opacity: .5; }
+
+  .seg { display: inline-flex; }
+  .seg > * + * { border-left: 0; }
+  #urlForm { display: flex; flex: 1 1 0; }
+  #urlForm button { border-left: 0; flex: none; }
+  /* width:0 drops the input's intrinsic ~20ch size; min-width (~8 characters) is measured and set by app.js */
+  #url { flex: 1; width: 0; }
+  #urlForm.hidden { display: none; }
+  #shaderGroup { margin-left: auto; }
+  #bar.sel-v #preset { width: 30px; padding: 0; color: transparent; background-position: center; }
+  #bar.url-focus #shaderGroup, #bar.url-focus #toggleSettings { display: none; }
+  /* "*" sits near the top of the letter box, so nudge it down to look centered */
+  #toggleSettings { min-width: 30px; padding: 5px 8px 0; }
+  #toggleCrt { min-width: 48px; } /* ON and OFF same width, no jump */
+
+  main { flex: 1; display: flex; min-height: 0; position: relative; }
+  #stage { flex: 1; padding: 20px; background: var(--k); min-width: 0; position: relative; }
+  #bezel { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; display: none; }
+  #screen { position: relative; width: 100%; height: 100%; background: var(--k); overflow: hidden; }
+  /* fixed CRT size (settings > 창 크기 변경): screen gets an explicit size from app.js, centered */
+  #stage.fixed { display: flex; align-items: center; justify-content: center; }
+  #stage.fixed #screen { flex: none; }
+  #screen > iframe, #screen > canvas, #lite { position: absolute; inset: 0; width: 100%; height: 100%; border: 0; }
+  #site { background: #fff; isolation: isolate; }
+  #crt { pointer-events: none; display: none; }
+  #lite {
+    pointer-events: none; display: none;
+    background:
+      radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,.45) 100%),
+      repeating-linear-gradient(to bottom, rgba(0,0,0,0) 0 2px, rgba(0,0,0,.28) 2px 3px);
+  }
+
+  /* notices: one stack pinned to the top-left of the area below the header, left edge in line
+     with the logo (= header side padding). Doesn't depend on the CRT area's size or position. */
+  #notices {
+    position: absolute; left: 20px; top: 20px; z-index: 4;
+    display: flex; flex-direction: column; gap: 12px; align-items: flex-start;
+    width: min(380px, calc(100% - 40px));
+  }
+  .overlay { width: 100%; background: var(--k); border: 1px solid var(--g); padding: 14px 16px; line-height: 1.5; }
+  .overlay.hidden { display: none; }
+  .overlay p { margin: 0 0 10px; text-wrap: pretty; } /* avoid a lone word on the last line */
+  .overlay .row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .overlay .err:empty { display: none; }
+  .overlay .err { margin: 10px 0 0; border-top: 1px solid var(--g); padding-top: 8px; }
+
+  /* Overlays the screen (doesn't resize it) with a dimmed background that reaches the window
+     edge; the inner scroller keeps the content and scrollbar 16px in from it. */
+  aside {
+    position: absolute; top: 0; right: 0; bottom: 0; z-index: 5;
+    width: min(296px, 85vw); border-left: 1px solid var(--g);
+    background: rgba(0, 0, 0, .7);
+    display: flex; flex-direction: column;
+  }
+  aside .scroll { flex: 1; min-height: 0; overflow-y: auto; margin-right: 16px; padding: 14px 12px 20px 20px; }
+  /* Line-style scrollbar (Chrome/Edge/Safari): a 1px vertical line with a hollow rectangle
+     handle that fills green while dragged. No arrow buttons; the track (line and handle travel)
+     stops 20px short of the panel's top and bottom.
+     Note: setting scrollbar-color would disable all of this in Chrome. */
+  aside .scroll::-webkit-scrollbar { width: 11px; }
+  aside .scroll::-webkit-scrollbar-button { display: none; height: 0; }
+  aside .scroll::-webkit-scrollbar-track {
+    margin: 20px 0;
+    background: linear-gradient(var(--g), var(--g)) center / 1px 100% no-repeat;
+  }
+  aside .scroll::-webkit-scrollbar-thumb { background: var(--k); border: 1px solid var(--g); min-height: 24px; }
+  aside .scroll::-webkit-scrollbar-thumb:hover { background: var(--gh); }
+  aside .scroll::-webkit-scrollbar-thumb:active { background: var(--g); }
+  @supports not selector(::-webkit-scrollbar) { /* Firefox: closest it allows */
+    aside .scroll { scrollbar-width: thin; scrollbar-color: var(--g) transparent; }
+  }
+  aside.hidden { display: none; }
+  /* group divider: runs left all the way to the panel's border line */
+  .group { margin: 28px 0 0 -20px; padding: 20px 0 0 20px; border-top: 1px solid var(--g); }
+  .check { display: flex; align-items: center; gap: 8px; cursor: pointer; margin: 0 0 8px; }
+  .sizes { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .group.hidden { display: none; }
+  .group.first { margin-top: 0; padding-top: 0; border-top: 0; }
+  /* foldable group titles */
+  /* 4px of hover background above, below and left of the text; the negative margins keep the
+     text itself where it was */
+  .gh { cursor: pointer; user-select: none; padding: 4px 0 4px 4px; margin: -4px 0 8px -4px; }
+  /* hovered title looks like a dropdown button: dark green fill + 1px green border */
+  .gh:hover { background: var(--gh); box-shadow: inset 0 0 0 1px var(--g); }
+  .group.folded .gh { margin-bottom: -4px; }
+  /* 1px-line v / ^ used in group titles (same drawing as the dropdown arrow) */
+  .chev { width: 9px; height: 5px; vertical-align: middle; position: relative; top: -1px; }
+  .group.folded .gbody { display: none; }
+  /* 제목 표시줄 빼기 takes the room it needs on one line; 초기화 stays small */
+  .crop-buttons { display: flex; gap: 6px; }
+  .crop-buttons button { white-space: nowrap; }
+  .crop-buttons button:first-child { flex: 1; }
+  .readout { margin-top: 12px; line-height: 1.6; }
+  .readout div { display: flex; justify-content: space-between; }
+  .check input {
+    -webkit-appearance: none; appearance: none; margin: 0; width: 14px; height: 14px; flex: none;
+    border: 1px solid var(--g); background: var(--k); cursor: pointer;
+  }
+  .check:hover input:not(:checked) { background: var(--gh); }
+  .check input:checked { background: var(--g); box-shadow: inset 0 0 0 2px var(--k); }
+  aside h3 { margin: 0 0 6px; }
+  .group h3 { margin-bottom: 12px; }
+  .desc { line-height: 1.5; margin: 0 0 12px; min-height: 42px; }
+  .ctl { margin: 0 0 12px; }
+  .ctl label { display: flex; justify-content: space-between; margin-bottom: 4px; }
+  .ctl select { width: 100%; }
+  #resetPreset { margin-top: 12px; }
+  .keys { line-height: 1.6; }
+
+  input[type=range] { -webkit-appearance: none; appearance: none; width: 100%; height: 18px; background: transparent; cursor: pointer; margin: 0; }
+  input[type=range]::-webkit-slider-runnable-track { height: 1px; background: var(--g); }
+  /* hollow handle: 1px green outline, black inside (covers the track line); fills green while dragged */
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; box-sizing: border-box; width: 10px; height: 18px; background: var(--k); border: 1px solid var(--g); border-radius: 0; margin-top: -8.5px; }
+  input[type=range]:hover::-webkit-slider-thumb { background: var(--gh); }
+  input[type=range]:active::-webkit-slider-thumb { background: var(--g); }
+  input[type=range]::-moz-range-track { height: 1px; background: var(--g); }
+  input[type=range]::-moz-range-thumb { box-sizing: border-box; width: 10px; height: 18px; background: var(--k); border: 1px solid var(--g); border-radius: 0; }
+  input[type=range]:hover::-moz-range-thumb { background: var(--gh); }
+  input[type=range]:active::-moz-range-thumb { background: var(--g); }
+
+  @media (max-width: 760px) {
+    header { padding: 10px 16px 8px; }
+    #stage { padding: 16px; }
+    #notices { left: 16px; top: 16px; width: min(380px, calc(100% - 32px)); }
+  }
+</style>
+</head>
+<body>
+<header id="bar">
+  <div class="logo"><span>web</span><span>CRT</span></div>
+  <div class="seg" id="modes">
+    <button data-mode="site" title="주소의 사이트를 페이지 안에 띄우고 그 위에 셰이더 (조작 가능)">URL</button>
+    <button data-mode="capture" title="다른 탭·창·화면을 캡처해서 셰이더">창</button>
+    <button data-mode="demo" title="테스트 화면">데모</button>
+  </div>
+  <form id="urlForm">
+    <input id="url" type="text" placeholder="https://..." spellcheck="false" autocomplete="url">
+    <button type="submit">열기</button>
+  </form>
+  <div class="seg" id="shaderGroup">
+    <select id="preset" title="셰이더 프리셋"></select>
+    <button id="toggleCrt" title="셰이더 켜기/끄기 (C)">ON</button>
+  </div>
+  <button id="toggleSettings" title="설정 패널 (S)" aria-label="설정">*</button>
+</header>
+
+<main>
+  <div id="stage">
+    <div id="screen">
+      <iframe id="site" referrerpolicy="strict-origin-when-cross-origin"
+        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads allow-pointer-lock allow-presentation"
+        allow="fullscreen; autoplay; clipboard-write; encrypted-media; picture-in-picture"></iframe>
+      <div id="lite"></div>
+      <canvas id="crt"></canvas>
+    </div>
+    <!-- monitor bezel drawn around the CRT area (settings > 환경 반사); clicks pass through -->
+    <canvas id="bezel"></canvas>
+  </div>
+
+  <!-- notices: fixed top-left stack under the logo, independent of the CRT area size; clear of the settings panel -->
+  <div id="notices">
+    <div class="overlay hidden" id="blocked">
+      <p>[ 임베드가 막힌 사이트예요 ]</p>
+      <p><span id="blockedHost"></span>은(는) 다른 페이지 안에 띄우는 걸 막아 두어서 여기서는 열리지 않을 거예요. 새 탭에서 연 다음 [ 창 ] 모드로 그 탭을 캡처하면 CRT로 볼 수 있어요.</p>
+      <div class="row">
+        <button class="primary" id="openInTab">새 탭에서 열고 캡처하기</button>
+        <button id="dismissBlocked">닫기</button>
+      </div>
+    </div>
+
+    <div class="overlay hidden" id="siteHint">
+      <p>[ 풀 셰이더 켜기 ]</p>
+      <p>지금은 간단한 스캔라인만 씌워져 있어요. 곡률·블룸·마스크가 들어간 [ 풀 셰이더 ]를 켜려면 화면 공유 권한이 필요해요.</p>
+      <p>공유 창에서 [ 이 탭 ]을 선택하세요. 이 페이지의 사이트 영역만 캡처되고 외부로 전송되지 않아요.</p>
+      <div class="row">
+        <button class="primary" id="startElem">풀 셰이더 켜기</button>
+        <button id="dismissHint">닫기</button>
+      </div>
+      <p class="err" id="elemErr"></p>
+    </div>
+
+    <div class="overlay hidden" id="center">
+      <p>[ 다른 탭·창·화면에 CRT 셰이더 씌우기 ]</p>
+      <p>CRT로 보고 싶은 탭이나 창을 고르세요. 조작은 원래 탭에서 하고, 결과는 이 창에서 봐요.</p>
+      <p>팁: 이 창과 원래 탭을 다른 창으로 나눠 두면 둘 다 보면서 쓸 수 있어요.</p>
+      <div class="row"><button class="primary" id="startCap">캡처할 화면 선택</button></div>
+      <p class="err" id="capErr"></p>
+    </div>
+  </div>
+
+  <aside id="settings" class="hidden">
+    <div class="scroll">
+      <!-- Each group folds: click its title. Titles are drawn by app.js as "[ 이름 ▴ ]" / "[ 이름 ▾ ]". -->
+      <section class="group first" data-group="shader">
+        <h3 class="gh" data-title="셰이더"></h3>
+        <div class="gbody">
+          <p class="desc" id="presetDesc"></p>
+          <div id="controls"></div>
+          <button id="resetPreset">프리셋 값으로 되돌리기</button>
+        </div>
+      </section>
+      <!-- room reflection: its own group, not part of any preset -->
+      <section class="group" data-group="reflect">
+        <h3 class="gh" data-title="환경 반사"></h3>
+        <div class="gbody">
+          <div class="sizes" id="reflType"></div>
+          <div class="ctl" id="reflStrWrap" style="margin-top: 12px"><label><span>반사 강도</span><span id="reflStrVal"></span></label>
+            <input type="range" id="reflStr" min="0.05" max="1" step="0.01"></div>
+          <label class="check" style="margin-top: 12px"><input type="checkbox" id="bezelOn"> 모니터 베젤 표시</label>
+        </div>
+      </section>
+      <section class="group" data-group="size">
+        <h3 class="gh" data-title="창 크기 변경"></h3>
+        <div class="gbody">
+          <div class="sizes" id="sizes"></div>
+          <div class="readout">
+            <div><span>브라우저 창</span><span id="winSize"></span></div>
+            <div><span>CRT 영역</span><span id="crtSize"></span></div>
+          </div>
+          <div class="ctl" style="margin-top: 12px"><label><span>CRT 바깥 여백</span><span id="marginVal"></span></label>
+            <input type="range" id="stageMargin" min="20" max="100" step="1"></div>
+        </div>
+      </section>
+      <!-- shown only in 창 mode -->
+      <section class="group hidden" id="cropGroup" data-group="crop">
+        <h3 class="gh" data-title="가장자리 잘라내기"></h3>
+        <div class="gbody">
+          <p class="desc">캡처한 창의 제목 표시줄이나 테두리를 잘라내요. 값은 원본 창의 px이라 창 크기가 바뀌어도 같은 만큼 잘려요.</p>
+          <div id="cropControls"></div>
+          <div class="crop-buttons">
+            <button id="cropTitle">제목 표시줄 빼기</button>
+            <button id="cropReset">초기화</button>
+          </div>
+        </div>
+      </section>
+      <section class="group" data-group="keys">
+        <h3 class="gh" data-title="단축키"></h3>
+        <div class="gbody">
+          <label class="check"><input type="checkbox" id="shortcutsOn"> 단축키 사용</label>
+          <div class="keys">
+            C 셰이더 켜기/끄기 · S 설정 · F 전체화면 · H 상단바 숨김 (Esc로 다시 표시) · [ ] 이전/다음 프리셋<br>
+            사이트 안이 아니라 이 페이지에 포커스가 있을 때만 동작해요.
+          </div>
+        </div>
+      </section>
+    </div>
+  </aside>
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
